@@ -1,0 +1,511 @@
+Biblioteki
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)   
+library(tsibble)     
+library(lubridate)   
+library(feasts)      
+library(fable)      
+library(fpp3)      
+library(tseries)
+
+```
+Wczytanie dnaych dla wszytskich zadań
+```{r}
+set.seed(429129) 
+myseries <- aus_retail |> 
+  filter(`Series ID` == sample(aus_retail$`Series ID`, 1)) |> 
+  as_tsibble(index = Month)
+head(myseries)
+```
+Dane pochodzą z zestawu aus_retail, a dzięki ustawieniu set.seed(429129) wybrano branżę **Hardware, building and garden supplies retailing**.
+
+
+
+
+##Typowe podejście prognostyczne
+
+Wykresy szeregu czasowego
+
+```{r}
+myseries |> autoplot(Turnover)
+```
+Dane przedstawiają miesięczne obroty w branży Hardware, building and garden supplies. Widoczny jest wyraźny trend rosnący – od lat 80. wartości obrotów systematycznie wzrastają, co może świadczyć o rozwoju rynku i rosnącym zapotrzebowaniu. Występuje silna sezonowość: w każdym roku pojawiają się powtarzalne wzorce z wyraźnymi szczytami i dołami, typowymi dla branż uzależnionych od pór roku. Około 2010 roku widoczny jest nagły spadek, po którym następuje ponowny wzrost.
+
+```{r}
+myseries |> gg_season(Turnover)
+```
+Obroty rosną od lipca do listopada, a najwyższe wartości pojawiają się pod koniec roku. Kształt sezonowy jest podobny w każdym roku, co potwierdza stabilną i powtarzalną strukturę sezonowości.
+
+```{r}
+myseries |> gg_subseries(Turnover)
+```
+Dla każdego miesiąca widoczny jest wyraźny trend rosnący – wartości Turnover systematycznie zwiększają się w czasie. Dodatkowo różnice między miesiącami są zauważalne: obroty w grudniu, listopadzie i październiku są znacznie wyższe niż w pozostałych miesiącach, co potwierdza silną sezonowość końca roku.
+
+```{r}
+myseries |> gg_lag(Turnover)
+```
+Wykres lagów pokazuje silną autokorelację szeregu czasowego. Obserwacje dla wszystkich opóźnień od 1 do 9 miesięcy układają się wzdłuż linii zbliżonej do przekątnej, co oznacza, że wartości Turnover są mocno zależne od poprzednich wartości. Im mniejsze opóźnienie, tym bardziej zwarta i liniowa jest zależność. Przeszłe wartości dobrze prognozują przyszłe.
+
+
+
+2. Dekompozycja metodą STL
+```{r}
+myseries |> model(STL(Turnover ~ season(window = "periodic"))) |> components() |> autoplot()
+```
+– W pierwszym panelu (Turnover) widoczny jest wyraźny wzrost obrotów w czasie oraz sezonowość.
+
+– Składnik trend pokazuje długoterminowy wzrost aż do ok. 2006 roku, po którym następuje lekkie spowolnienie aby potem znów wzrosnąć.
+
+– Składnik season_year ma stały, powtarzalny kształt przez cały okres – to silna, stabilna sezonowość roczna.
+
+– Składnik remainder (reszta) pokazuje nieregularne odchylenia – ich amplituda rośnie z czasem, co może sugerować heteroskedastyczność.
+
+
+##Przekształcenia szeregów czasowych - transformacja i dekompozycja
+
+1. Podział na zbiór uczący (przed 2011) i testowy(od 2011)
+
+```{r, warning=FALSE, message=FALSE}
+train <- myseries |> filter(Month < yearmonth("2011 Jan"))
+test <- myseries |> filter(Month >= yearmonth("2011 Jan"))
+```
+
+2. Sprawdzenie sezonowości:
+
+```{r, warning=FALSE, message=FALSE}
+fit_naive <- train |> model(NAIVE(Turnover))
+fit_snaive <- train |> model(SNAIVE(Turnover))
+
+fc_naive <- fit_naive |> forecast(h = nrow(test))
+fc_snaive <- fit_snaive |> forecast(h = nrow(test))
+
+accuracy(fc_naive, test)
+accuracy(fc_snaive, test)
+```
+Lepsze wyniki było dla naive bez sesonowości, więc on był brany dalej w tym zadaniu
+
+3. Czy Box-Cox lub odsezonowienie poprawia wyniki?
+
+a) Box-Cox
+```{r, warning=FALSE, message=FALSE}
+# 1. Optymalne lambda
+lambda <- train |>
+  features(Turnover, features = guerrero) |>
+  pull(lambda_guerrero)
+
+# 2. Dopasuj NAIVE(box_cox)
+fit_bc <- train |>
+  model(NAIVE(box_cox(Turnover, lambda)))
+h <- nrow(test)
+# 3. Prognoza i inwersja transformacji
+fc_bc <- fit_bc |>
+  forecast(h = h) |>
+  mutate(.mean = inv_box_cox(.mean, lambda))
+
+# 4. Accuracy
+accuracy(fc_bc, test) |> select(ME, RMSE, MAPE)
+
+
+```
+
+b) Odsezonowienie przez STL
+
+
+```{r, warning=FALSE, message=FALSE}
+
+# 1. Pełna dekompozycja STL całego szeregu
+full_stl        <- myseries |> 
+  model(STL(Turnover ~ season(window = "periodic")))
+
+# 2. Wyciągamy komponenty (mają kolumnę Month oraz season_adjust)
+full_components <- full_stl |> components()
+
+# 3. Przygotowujemy odsezonowany zbiór uczący i testowy
+train_ds <- full_components |>
+  filter(Month < yearmonth("2011 Jan")) |>
+  select(Month, Turnover = season_adjust) |>
+  as_tsibble(index = Month)
+
+test_ds <- full_components |>
+  filter(Month >= yearmonth("2011 Jan")) |>
+  select(Month, Turnover = season_adjust) |>
+  as_tsibble(index = Month)
+
+# 4. Dopasowujemy model naiwny na odsezonowanym szeregu
+fit_ds <- train_ds |> 
+  model(NAIVE(Turnover))
+
+# 5. Robimy prognozę
+fc_ds <- fit_ds |> 
+  forecast(h = nrow(test_ds))
+
+# 6. Oceniamy dokładność
+accuracy(fc_ds, test_ds) |> 
+  select(ME, RMSE, MAPE)
+
+```
+
+
+
+
+
+4. Analiza reszt dla wybranego modelu
+```{r, warning=FALSE, message=FALSE}
+# Weź ponownie fit_naive z kroku 2
+report(fit_naive)
+
+# Wykres reszt
+residuals(fit_naive) |>
+  autoplot() +
+  ggtitle("Reszty modelu NAIVE")
+
+# ACF/PACF reszt
+residuals(fit_naive, type="response") |>
+  gg_tsdisplay(plot_type="partial")  # ACF i PACF
+
+# Test Ljunga–Boxa
+augment(fit_naive) |>
+  features(.innov, ljung_box, lag=24, dof=0)
+
+```
+
+
+## Prognozowanie metodami ETS
+1. Dane zaczerpniętą z zadania 2
+2. Holt–Winters multiplicative seasonal (M), z i bez damping’u
+
+```{r, warning=FALSE, message=FALSE}
+hw_models <- train %>% model(
+  HW_nodamp = ETS(Turnover ~ error("A") + trend("A")),  # additive trend
+  HW_damp   = ETS(Turnover ~ error("A") + trend("Ad"))   # additive *damped* trend
+)
+```
+
+2.1 Prognozy i porównanie RMSE
+
+```{r, warning=FALSE, message=FALSE}
+hw_fc  <- hw_models |> forecast(h = h)
+hw_acc <- accuracy(hw_fc, test) |> select(.model, RMSE)
+print(hw_acc)
+
+```
+
+3. Wybór i diagnostyka najlepszego HW
+
+```{r, warning=FALSE, message=FALSE}
+best_hw_name <- hw_acc |> arrange(RMSE) |> slice(1) |> pull(.model)
+best_fit     <- hw_models[[best_hw_name]][[1]]
+
+```
+
+3.1 Reszty wybranego modelu
+
+```{r, warning=FALSE, message=FALSE}
+
+res_hw <- residuals(best_fit)
+res_hw |> autoplot() + ggtitle(paste("Reszty modelu", best_hw_name))
+res_hw |> gg_tsdisplay(plot_type = "partial")
+```
+
+3.2 Test Ljung–Box
+
+```{r, warning=FALSE, message=FALSE}
+augment(best_fit) %>% features(.innov, ljung_box, lag = 24, dof = 0)
+
+```
+
+4. Porównanie wybranego HW z prognozą naiwną
+
+```{r, warning=FALSE, message=FALSE}
+
+
+naive_rmse <- accuracy(fc_naive, test) %>% pull(RMSE)
+cat("RMSE NAIVE:       ", naive_rmse, "\n")
+cat("RMSE najlepszy HW:", hw_acc %>% filter(.model == 'HW_nodamp') %>% pull(RMSE), "\n")
+
+```
+
+5. Ulepszenie 1: dekompozycja STL + ETS na odsezonowanych danych
+
+```{r, warning=FALSE, message=FALSE}
+full_stl   <- myseries %>% model(STL(Turnover ~ season(window="periodic")))
+full_comp  <- components(full_stl)
+train_ds   <- full_comp %>% filter(Month < yearmonth("2011 Jan")) %>% 
+               select(Month, Turnover = season_adjust) %>% as_tsibble(index = Month)
+test_ds    <- full_comp %>% filter(Month >= yearmonth("2011 Jan")) %>% 
+               select(Month, Turnover = season_adjust) %>% as_tsibble(index = Month)
+ets_ds_fit <- train_ds %>% model(ETS(Turnover))
+ets_ds_rmse<- accuracy(ets_ds_fit %>% forecast(h = nrow(test_ds)), test_ds) %>% pull(RMSE)
+cat("RMSE STL + ETS deseason: ", ets_ds_rmse, "\n")
+
+
+```
+
+6. Ulepszenie 2: transformacja Box-Cox + ETS
+
+```{r, warning=FALSE, message=FALSE}
+lambda     <- train %>% features(Turnover, features = guerrero) %>% pull(lambda_guerrero)
+ets_bc_fit <- train %>% model(ETS(box_cox(Turnover, lambda)))
+ets_bc_fc  <- ets_bc_fit %>% forecast(h = h) %>% mutate(.mean = inv_box_cox(.mean, lambda))
+ets_bc_rmse<- accuracy(ets_bc_fc, test) %>% pull(RMSE)
+cat("RMSE Box-Cox + ETS:      ", ets_bc_rmse, "\n")
+
+```
+
+
+## Metody Statystyczne - ARIMA
+Zbuduj dla swojego modelu prognozę ARIMA w wersji automatycznej. 
+```{r}
+fit_arima <- myseries |>
+  model(ARIMA(Turnover))
+
+report(fit_arima)
+```
+Model automatyczny ARIMA dopasował się jako ARIMA(1,0,3)(0,1,1)[12], co oznacza uwzględnienie autoregresji rzędu 1, składnika MA rzędu 3 oraz sezonowego MA rzędu 1 z sezonowością roczną.
+
+
+Sprawdź czy przy automatycznie wybranej prognozie dane na których ona bazuje (czyli dane wejściowe) są stacjonarne.
+```{r}
+# Test ADF na oryginalnym szeregu
+adf.test(myseries$Turnover)
+```
+**Hipoteza zerowa (H₀)**: szereg jest niestacjonarny
+
+**Hipoteza alternatywna (H₁)**: szereg jest stacjonarny
+
+Ponieważ:
+
+p-value < 0.05 ⇒ **odrzucamy H0** na poziomie istotności 5%.
+
+Oznacza to, że:  **Dane Turnover są stacjonarne bez konieczności różnicowania**. Dane są stacjonarne w sensie niesezonowym i nie wymagają różnicowania ogólnego (d = 0). Automatycznie dobrany model ARIMA(1,0,3)(0,1,1)[12] zawiera tylko różnicowanie sezonowe (D = 1), co sugeruje sezonową niestacjonarność szeregu.
+
+
+```{r}
+# Dodatkowo przedstawiono prognozę uzyskaną z automatycznego modelu ARIMA
+# Prognoza na 12 miesięcy
+fc <- fit_arima |> forecast(h = 12)
+
+
+fc |> autoplot(colour = "deeppink") +
+  autolayer(myseries, Turnover, colour = "black") +
+  labs(
+    title = "Prognoza Turnover (ARIMA automatyczna)",
+    subtitle = "Czarna linia: dane historyczne | Różowa linia: prognoza ARIMA na 12 miesięcy",
+    y = "Turnover",
+    x = "Rok"
+  ) +
+  theme_minimal()
+```
+
+
+## Modele lokalne vs Modele Globalne
+Dla swoich danych przeprowadź prognozę różnymi metodami z zadania 5.1 i porównaj wyniki.
+  Zadanie 5.1 - modele lokalne
+2. Przeprowadź zbiorczą analizę eksploracyjną szeregów - w tym celu wykorzystaj:
+   1. ACF_Feature - https://otexts.com/fpp3/stlfeatures.html
+   2. STL_Featur - https://otexts.com/fpp3/stlfeatures.html
+```{r}
+myseries |>
+  features(Turnover, feat_stl)
+
+
+myseries |>
+  ggplot(aes(x = Month, y = Turnover)) +
+  geom_line(color = "darkred") +
+  labs(
+    title = "Szereg czasowy Turnover (Hardware w Western Australia)",
+    x = "Data",
+    y = "Obroty (Turnover)"
+  ) +
+  theme_minimal()
+```
+```{r}
+myseries |>
+  features(Turnover, feat_acf)
+
+myseries |>
+  ACF(Turnover) |>
+  autoplot() +
+  labs(
+    title = "Wykres ACF dla szeregu Turnover",
+    x = "Opóźnienie (lag)",
+    y = "Wartość ACF"
+  ) +
+  theme_minimal()
+```
+Wykres ACF pokazuje, że szeregi są silnie autokorelacyjne nawet przy dużych opóźnieniach, co potwierdza obecność struktury czasowej. Kolejne wartości obrotów są mocno zależne od poprzednich, a poziom korelacji spada bardzo wolno.
+
+**Podsumowanie STL i ACF:**
+**STL decomposition:**
+– trend_strength = 0.996
+– seasonal_strength_year = 0.929
+
+Dane są niemal w pełni wyjaśnione przez trend i sezonowość. Trend dominuje, a sezonowość jest bardzo silna i regularna.
+
+Cechy ACF:
+– acf1 = 0.973 – bardzo wysoka autokorelacja rzędu 1
+– acf10 = 8.37 – suma kwadratów pierwszych 10 ACF-czyli silne powiązanie z przeszłością
+– diff1_acf1 = -0.066 – po różnicowaniu autokorelacja prawie znika
+
+Dane są bardzo silnie skorelowane z poprzednimi wartościami, ale po różnicowaniu ogólnym zależności słabną. To potwierdza, że szereg jest niestacjonarny trendowo, ale staje się bardziej stacjonarny po różnicowaniu, co dobrze koreluje z tym, że model ARIMA miał część różnicującą sezonowo, ale nie ogólnie (d = 0, D = 1)
+
+   
+
+3.  Podziel próbkę na uczącą i testową (będziemy budowali prognozę na 5 lat).
+```{r}
+train2 <- myseries |> filter_index(. ~ "2013 Dec")
+test2  <- myseries |> filter_index("2014 Jan" ~ .)
+```
+
+4.  Dla próbki uczącej zbudujmy modele z dobranymi automatycznie parametrami:
+    1.  Naivna
+    2.  Naiwna z przesunięciem sezonowym rocznym
+    3.  ETS
+    4.  ARIMA
+    5.  Theta
+    6.  Model regresji liniowej - wykorzystaj predyktory https://otexts.com/fpp3/useful-predictors.html
+    7.  Prosty sieć neuronowa - https://otexts.com/fpp3/nnetar.html
+    
+```{r}
+models <- train2 |> 
+  model(
+    naive = NAIVE(Turnover),
+    snaive = SNAIVE(Turnover),
+    ets = ETS(Turnover),
+    arima = ARIMA(Turnover),
+    theta = THETA(Turnover),
+    tslm = TSLM(Turnover ~ trend() + season() + fourier(K = 2)),
+    nnetar = NNETAR(Turnover)
+  )
+
+```
+
+```{r warning=FALSE}
+report(models)
+accuracy(models)
+fc <- models |> forecast(h = "5 years")
+
+accuracy(fc, test)
+
+```
+1. **Najlepszy model: ARIMA**
+– Najniższy RMSE (15.43), MAE (11.04), MAPE (6.32), MASE (0.50)
+– Najlepiej dopasowany i najdokładniejszy ze wszystkich
+
+2. Drugie miejsce: ETS
+– RMSE (14.54) jeszcze lepszy, ale MAE i MAPE gorsze niż ARIMA
+– Dobry, ale lekko przegrywa z ARIMA pod względem stabilności błędów
+
+3. TSLM – w porządku
+– RMSE = 17.35, MAPE = 7.32 – wyraźnie lepszy niż NNETAR czy snaive
+– Dobry kompromis między prostotą a skutecznością
+
+4. NNETAR, theta – średnio
+– Wyższe błędy, zwłaszcza MAE i MAPE
+– Nie radzą sobie lepiej niż klasyczne podejścia
+
+5. Najsłabsze: naive, snaive
+– Największe błędy prognoz
+– RMSE ponad 26–27, MAPE powyżej 13–14
+
+
+```{r}
+fc |> autoplot(train, level = NULL) +
+  autolayer(test, Turnover, colour = "black") +
+  labs(
+    title = "Porównanie prognoz różnych modeli",
+    y = "Turnover",
+    x = "Data"
+  )
+
+```
+
+
+
+5. Sprawdz czy wszystkie modele zostały poprawnie zbudowane (nie ma modelu NULL)
+```{r}
+sapply(models, function(x) is.null(x))
+```
+
+6. Wybierze najlepszą rodzinę w oparciu o próbkę uczącą:
+        -   Kryterium 1: Rodzina której średni RMSE jest najniższe (trafność)
+```{r}
+acc <- accuracy(models)
+acc %>% group_by(.model) %>% summarize(mean(RMSE))
+```
+ARIMA ma najniższe średnie RMSE.
+        
+        -   Kryterium 2: Rodzina dla której MASE jest najczęściej mniejsze od 1 (wartość dodana)
+```{r}
+acc %>% group_by(.model) %>% 
+  filter(MASE < 1) %>%
+  
+  summarize(liczbaMASE = n())
+```
+5 modeli spełnia warunek, ale tylko ARIMA i ETS mają też MASE bliskie 0.37 (nastepny punkt)
+        
+        -   Kryterium 3: Rodzina, która najcześciej dostarcza najlepszą prognozę. 
+```{r}
+acc %>% group_by(.model) %>% 
+  summarize(mean(RMSE), mean(MAE), mean(MASE))
+```
+ARIMA i ETS znów wypadają najlepiej na wszystkich trzech miarach - są to najbardziej stabilne i trafne modele.
+        
+7. Porównaj średnie RMSE dla próbki uczącej i testowej - czy mamy do czynienia z przeuczeniam modelu?
+```{r warning=FALSE}
+forecasty_test <- models %>%
+  forecast(h = 20)
+
+acc_test <- accuracy(forecasty_test, test)
+
+# RMSE dla próby uczącej
+acc_train <- accuracy(models)
+
+# Średnie RMSE per model:
+train_rmse <- acc_train %>%
+  group_by(.model) %>%
+  summarise(train_RMSE = mean(RMSE, na.rm = TRUE))
+
+test_rmse <- acc_test %>%
+  group_by(.model) %>%
+  summarise(test_RMSE = mean(RMSE, na.rm = TRUE))
+
+# Porównanie
+left_join(train_rmse, test_rmse, by = ".model")
+```
+ARIMA jest najlepiej dopasowany i nieprzeuczony, ETS lekko przeuczony, reszta modeli wykazuje większe różnice lub po prostu niską jakość prognozy
+```{r}
+rmse_table <- tibble::tibble(
+  .model = c("arima", "ets", "naive", "nnetar", "snaive", "theta", "tslm"),
+  train_RMSE = c(5.213512, 5.318621, 11.716468, 8.632777, 12.827490, 7.710731, 17.297693),
+  test_RMSE = c(6.318056, 11.189116, 30.436754, 11.173852, 13.813164, 24.220211, 13.410375)
+)
+
+rmse_table <- rmse_table |>
+  mutate(
+    RMSE_diff_pct = round((test_RMSE - train_RMSE) / train_RMSE * 100, 1),
+    Overfitting = case_when(
+      RMSE_diff_pct < 20 ~ "brak przeuczenia",
+      RMSE_diff_pct < 50 ~ "umiarkowane przeuczenie",
+      RMSE_diff_pct >= 50 ~ "silne przeuczenie",
+      RMSE_diff_pct < 0 ~ "model lepszy na zbiorze testowym"
+      )
+  )
+
+print(rmse_table)
+```
+ARIMA: umiarkowane przeuczenie (wzrost RMSE o 21,2%) – model dobrze generalizuje, brak dużych różnic między zbiorami
+
+ETS: silne przeuczenie (wzrost o 110,4%) – bardzo dobre dopasowanie do danych uczących, ale znacząco słabsze wyniki na danych testowych
+
+Naive: silne przeuczenie (wzrost o 159,8%) – model bardzo słabo generalizuje
+
+NNETAR: umiarkowane przeuczenie (29,4%) – różnica nie jest drastyczna, ale wskazuje na spadek jakości na danych testowych
+
+SNaive: brak przeuczenia (7,7%) – model ma podobną jakość na obu zbiorach, choć ogólnie prognozuje słabo
+
+Theta: najsilniejsze przeuczenie (214,1%) – model mocno dopasowany do treningu, słabe wyniki poza próbą
+
+TSLM: błąd prognozy na danych testowych był niższy niż na uczących (–22,5%), co wyklucza przeuczenie. Może to jednak wynikać z niedouczenia modelu lub prostszej struktury danych testowych.
+
+
